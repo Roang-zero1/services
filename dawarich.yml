@@ -1,0 +1,170 @@
+networks:
+  dawarich:
+  proxy:
+    name: proxy
+    external: true
+
+services:
+  dawarich_redis:
+    image: valkey/valkey:8-alpine3.21
+    container_name: dawarich_redis
+    networks:
+      - dawarich
+    volumes:
+      - dawarich_redis_data:/var/shared/redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli ping | grep PONG"]
+      interval: 10s
+      retries: 5
+      start_period: 30s
+      timeout: 10s
+  dawarich_db:
+    image: postgres:17-alpine
+    shm_size: 1G
+    container_name: dawarich_db
+    volumes:
+      - dawarich_db_data:/var/lib/postgresql/data
+    networks:
+      - dawarich
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: dawarich_production
+      PGPORT: 55432
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "postgres" ]
+      interval: 10s
+      retries: 5
+      start_period: 30s
+      timeout: 10s
+  dawarich_app:
+    image: freikin/dawarich:0.23.5
+    container_name: dawarich_app
+    volumes:
+      - dawarich_public:/var/app/public
+      - dawarich_watched:/var/app/tmp/imports/watched
+    networks:
+      - dawarich
+      - proxy
+    ports:
+      - 3000:3000
+      # - 9394:9394 # Prometheus exporter, uncomment if needed
+    stdin_open: true
+    tty: true
+    entrypoint: web-entrypoint.sh
+    command: ['bin/rails', 'server', '-p', '3000', '-b', '::']
+    restart: on-failure
+    environment:
+      RAILS_ENV: production
+      REDIS_URL: redis://dawarich_redis:6379/0
+      DATABASE_HOST: dawarich_db
+      DATABASE_PORT: 55432
+      DATABASE_USERNAME: postgres
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
+      DATABASE_NAME: dawarich_production
+      MIN_MINUTES_SPENT_IN_CITY: 60
+      APPLICATION_HOSTS: localhost,::1,127.0.0.1,${DAWARICH_TRAEFIK_URL}
+      TIME_ZONE: Europe/Vienna
+      APPLICATION_PROTOCOL: http
+      DISTANCE_UNIT: km
+      PROMETHEUS_EXPORTER_ENABLED: false
+      PROMETHEUS_EXPORTER_HOST: 0.0.0.0
+      PROMETHEUS_EXPORTER_PORT: 9394
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      RAILS_LOG_TO_STDOUT: "true"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+    healthcheck:
+      test: [ "CMD-SHELL", "wget -qO - http://127.0.0.1:3000/api/v1/health | grep -q '\"status\"\\s*:\\s*\"ok\"'" ]
+      interval: 10s
+      retries: 30
+      start_period: 30s
+      timeout: 10s
+    depends_on:
+      dawarich_db:
+        condition: service_healthy
+        restart: true
+      dawarich_redis:
+        condition: service_healthy
+        restart: true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'    # Limit CPU usage to 50% of one core
+          memory: '4G'    # Limit memory usage to 2GB
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.dawarich.rule=Host(`${DAWARICH_TRAEFIK_URL}`)"
+      - "traefik.http.routers.dawarich.entrypoints=websecure"
+      - "traefik.http.routers.dawarich.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.dawarich.service=dawarich"
+      - "traefik.http.services.dawarich.loadbalancer.server.port=3000"
+      
+  dawarich_sidekiq:
+    image: freikin/dawarich:0.23.5
+    container_name: dawarich_sidekiq
+    volumes:
+      - dawarich_public:/var/app/public
+      - dawarich_watched:/var/app/tmp/imports/watched
+    networks:
+      - dawarich
+    stdin_open: true
+    tty: true
+    entrypoint: sidekiq-entrypoint.sh
+    command: ['bundle', 'exec', 'sidekiq']
+    restart: on-failure
+    environment:
+      RAILS_ENV: production
+      REDIS_URL: redis://dawarich_redis:6379/0
+      DATABASE_HOST: dawarich_db
+      DATABASE_PORT: 55432
+      DATABASE_USERNAME: postgres
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
+      DATABASE_NAME: dawarich_production
+      APPLICATION_HOSTS: localhost,::1,127.0.0.1
+      BACKGROUND_PROCESSING_CONCURRENCY: 10
+      APPLICATION_PROTOCOL: http
+      DISTANCE_UNIT: km
+      PROMETHEUS_EXPORTER_ENABLED: false
+      PROMETHEUS_EXPORTER_HOST: dawarich_app
+      PROMETHEUS_EXPORTER_PORT: 9394
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      RAILS_LOG_TO_STDOUT: "true"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+    healthcheck:
+      test: [ "CMD-SHELL", "bundle exec sidekiqmon processes | grep $${HOSTNAME}" ]
+      interval: 10s
+      retries: 30
+      start_period: 30s
+      timeout: 10s
+    depends_on:
+      dawarich_db:
+        condition: service_healthy
+        restart: true
+      dawarich_redis:
+        condition: service_healthy
+        restart: true
+      dawarich_app:
+        condition: service_healthy
+        restart: true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'    # Limit CPU usage to 50% of one core
+          memory: '4G'    # Limit memory usage to 2GB
+
+volumes:
+  dawarich_db_data:
+  dawarich_redis_data:
+  dawarich_public:
+  dawarich_watched:
